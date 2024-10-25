@@ -1,0 +1,147 @@
+import math
+import os
+import re
+import asyncio
+import datetime
+import pytz
+import pandas as pd
+from urllib.parse import urlparse
+from crowd_sdk.tagme import TagmeClientAdvanced
+import sys
+
+from numpy._core.multiarray import item
+
+
+class TaskHandler:
+    def __init__(self, url: str):
+        self._host = urlparse(url).netloc
+        self._org_id = urlparse(url).path.split('/')[2]
+        self._project_id = urlparse(url).path.split('/')[4]
+        self._task_id = urlparse(url).path.split('/')[6]
+
+        # self.reference_data = 'referens_data/reference_data.xlsx'
+        self.client = TagmeClientAdvanced(self.get_config_path())
+
+    def get_config_path(self) -> str:
+        configs = {
+            'tagme.apps.prom-gen.sigma.sbrf.ru': '~/configs/.sigma.cfg',
+            'tagme.sberdevices.ru': '~/configs/.cloud.cfg'
+        }
+
+        return os.path.expanduser(configs[self._host])
+
+    async def get_markers_info(self) -> dict:
+        persons = await self.client.get_persons(with_organizations=True,
+                                                organization_id=self._org_id)
+
+        markers_info = {}
+
+        for person in persons:
+            if person.organizations:
+                markers_info.update({
+                    person.uid: {
+                        'email': person.email,
+                        'full_name': f'{person.last_name} {person.first_name}'
+                    }
+                })
+        # print(markers_info)
+        return markers_info
+
+    async def get_filename(self):
+        task_info = await self.client.get_task(task_id=self._task_id,
+                                               organization_id=self._org_id)
+
+
+        prohibited_chars = r'[\\/*?:"<>|]'
+        cleaned_task_name = re.sub(prohibited_chars, '', f"{task_info.name}")
+
+        return f'{cleaned_task_name} {self._task_id}.xlsx'
+
+    async def create_report(self, cleaned_task_name):
+
+        task = await self.client.get_task(task_id=self._task_id,
+                                          organization_id=self._org_id)
+
+        markers = await self.get_markers_info()
+
+        assignments = await self.client.get_task_assignments(task_id=self._task_id,
+                                                             organization_id=self._org_id)
+
+        assignments = [assignment for assignment in assignments if assignment.result]
+
+        # Создаем список для хранения итоговых данных
+        results = []
+
+        # Группируем задания по имени файла
+        grouped_assignments = {}
+        for assignment in assignments:
+            file_name = assignment.file_name
+            if file_name not in grouped_assignments:
+                grouped_assignments[file_name] = []
+            grouped_assignments[file_name].append(assignment)
+
+        # Итерируемся по группам и распределяем данные в разные столбцы
+        for file_name, assignments_group in grouped_assignments.items():
+            file_info = {'Имя файла': file_name}
+            for i, assignment in enumerate(assignments_group, 1):
+                full_task = assignment.result['full_task']
+                validate = assignment.result['validate']
+                person = markers[assignment.marker_id]['full_name']
+                start_date = assignment.start_date.strftime('%Y-%m-%d %H:%M:%S')
+                end_date = assignment.end_date.strftime('%Y-%m-%d %H:%M:%S')
+                full_task_orig = assignment.result['full_task']
+                # product = assignment.result['product']if assignment.result['product'] else ''
+                product = ''.join(str(item) for item in assignment.result['product']) if assignment.result['product'] else ''
+                product = product.replace('[', '').replace(']', '')
+
+                # Применяем разметку для каждого размеченного диалога
+                info = set()
+                for mark in assignment.result['marks']:
+                    text = mark['text']
+                    entity_id = mark['entityId']
+                    if text not in info:
+                        if entity_id == "entity-1":
+                            full_task = full_task.replace(f' {text} ', f' [SEP1]{text}[SEP1] ')
+                            full_task = full_task.replace(f' {text}-', f' [SEP1]{text}-[SEP1] ')
+                            full_task = full_task.replace(f'-{text} ', f'[SEP1]-{text}[SEP1] ')
+                        elif entity_id == "entity-2":
+                            full_task = full_task.replace(f' {text} ', f' [SEP2]{text}[SEP2] ')
+                            full_task = full_task.replace(f' {text}-', f' [SEP2]{text}-[SEP2] ')
+                            full_task = full_task.replace(f'-{text} ', f'[SEP2]-{text}[SEP2] ')
+                        info.add(text)
+
+                # Добавляем информацию в итоговый список
+                file_info.update({
+                    f'Диалог': full_task_orig,
+                    f'Продукт': product,
+                    f'Диалог разметка {i}': full_task,
+                    f'Валидация {i}': validate,
+                    f'Разметчик {i}': person,
+                    f'Время начала диалога {i}': start_date,
+                    # f'Время конца диалога {i}': end_date
+                })
+            results.append(file_info)
+
+        # Создаем DataFrame и сохраняем в файл
+        output_folder = 'out'
+        os.makedirs(output_folder, exist_ok=True)
+        output_file = os.path.join(output_folder, f'СВОД_{cleaned_task_name}.xlsx')
+
+        results_df = pd.DataFrame(results)
+        results_df.to_excel(output_file, index=False)
+        print(f"Данные сохранены в файл {output_file}")
+
+async def main():
+    task_url = input('Введите ссылку на задачу:\n')
+    task_handler = TaskHandler(task_url)
+
+    creat = await task_handler.get_filename()
+    await task_handler.create_report(creat)
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
+
+
+
+
